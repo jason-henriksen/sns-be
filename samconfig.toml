@@ -1,0 +1,9 @@
+version = 0.1
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "sns-be"
+s3_bucket = "sns-be"
+s3_prefix = "sns-be"
+region = "us-west-2"
+capabilities = "CAPABILITY_IAM"

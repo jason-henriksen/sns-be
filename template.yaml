@@ -1,0 +1,483 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Transform: AWS::Serverless-2016-10-31
+
+Globals:
+  Api:
+    # Allows an application running locally on port 8080 to call this API
+    Cors:
+      AllowMethods: "'*'"
+      AllowHeaders: "'*'"
+      AllowOrigin: "'*'"
+  Function:
+    Timeout: 29
+
+
+Resources:
+  
+
+######## SNS Topic Support ########
+
+  # This is the topic that everyone will listen to or publish to
+  AuditionNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-audition-topic'
+
+  # Liberal permissions for everybody!  ( Don't do this at work )
+  AuditionNotificationTopicAccessPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Id:
+          Ref: AuditionNotificationTopic
+        Statement:
+          -
+            Action:
+              - "sns:Publish"
+              - "SNS:GetTopicAttributes"
+              - "SNS:SetTopicAttributes"
+              - "SNS:AddPermission"
+              - "SNS:RemovePermission"
+              - "SNS:DeleteTopic"
+              - "SNS:Subscribe"
+              - "SNS:ListSubscriptionsByTopic"
+              - "SNS:Publish"
+              - "SNS:Receive"
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Resource:
+              Ref: AuditionNotificationTopic
+      Topics:
+       -
+         Ref: AuditionNotificationTopic
+
+
+
+######## ElasticSearch Logging ########
+
+# ES is a search database.  We're going to look up logs based on an Agency name.
+# It's easier to search this database than it is to search dynamoDB. And it's easier to set this up than an RDS
+
+  #---- Setup Lambda
+  # delete and recreate the index.
+  # THIS WILL DESTROY ALL LOGS!
+  # ES indexes are volatile, but because this is a test tool, there is no 'system of record'
+  # once the index is deleted, you can only see data from that point forward
+  # this applies to all recorded hooks in this test tool.
+  # Really, this should be done with some local setup tool, but this seems as easy as anywhere else to put it.
+  ESIndexSetup:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/esIndexSetup.handler
+      Runtime: nodejs12.x
+      Environment:
+        Variables:
+          ESURL: !GetAtt WebHookLogDomain.DomainEndpoint
+      Events:
+        InspectionApi:
+          Type: Api
+          Properties:
+            Path: /setup-es
+            Method: GET
+
+  #---- Database Definition
+  WebHookLogDomain:
+    Type: AWS::Elasticsearch::Domain
+    Properties:
+      DomainName: "webhook-log-storage"
+      ElasticsearchVersion: "7.4"
+      ElasticsearchClusterConfig:
+        InstanceCount: 1
+        InstanceType: "t2.small.elasticsearch"
+      EBSOptions:
+        EBSEnabled: true
+        Iops: 0
+        VolumeSize: 10
+        VolumeType: "gp2"
+      SnapshotOptions:
+        AutomatedSnapshotStartHour: 0
+      # AccessPolicies:
+      #   Version: "2012-10-17"
+      #   Statement:
+      #     - Effect: "Allow"
+      #       Principle:
+      #         AWS: "*"
+      #       Action: "es:*"
+      #       Resource: "arn:aws:es:us-west-2:050440021590:domain/webhook-log-storage/*"
+
+
+
+######## Web Hook Support ########
+
+  #---- Web Hook Listener Lambda
+  # This is the lambda that will be called by SNS when a message is sent to the topic ( for api integrations )
+  # Each agent has it's own state and name in the URL, so we're using that to pretend that they're 
+  # all different companies.
+  #
+  # expects to be called from SNS with: state/name
+  # this will correctly handle the SNS subscription response
+  # will also log all messages into an ES database
+  # Since this is just a demo, the same receiver URL is being used for all clients.  In reality they'd be all different.
+  HookListener:
+    Type: AWS::Serverless::Function
+    FunctionName: HookListener
+    Properties:
+      Handler: webhook.handler
+      Runtime: nodejs12.x
+      Environment:
+        Variables:
+          ESURL: !GetAtt WebHookLogDomain.DomainEndpoint
+      Events:
+        InspectionApi:
+          Type: Api
+          Properties:
+            Path: /webhook/{state}/{name}
+            Method: POST
+
+  #---- Web Hook Log Download
+  # returns a log of all messages received by the HookListener
+  # given the state and name of the agency, it returns the messages that were saved for that agency
+  HookLog:
+    Type: AWS::Serverless::Function
+    FunctionName: HookLog
+    Properties:
+      Handler: esIndexReport.handler
+      Runtime: nodejs12.x
+      Environment:
+        Variables:
+          ESURL: !GetAtt WebHookLogDomain.DomainEndpoint
+      Events:
+        InspectionApi:
+          Type: Api
+          Properties:
+            Path: /report/{state}/{name}
+            Method: GET
+
+
+######## Actor Subscriptions ########
+
+  ActorSubscribe:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: actorSubscribe.handler
+      Runtime: nodejs12.x
+      Description: subscribe a url to the review topic
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName:
+              Ref: AuditionNotificationTopic
+      Environment:
+        Variables:
+          TopicName:
+            Ref: AuditionNotificationTopic      
+      Events:
+        SampleApi:
+          Type: Api
+          Properties:
+            Path: /actor/sub/{phone}/{state}/{gender}
+            Method: PUT
+
+  ActorUnSubscribe:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: actorUnSubscribe.handler
+      Runtime: nodejs12.x
+      Description: subscribe a url to the review topic
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName:
+              Ref: AuditionNotificationTopic
+      Environment:
+        Variables:
+          TopicName:
+            Ref: AuditionNotificationTopic      
+      Events:
+        SampleApi:
+          Type: Api
+          Properties:
+            Path: /actor/sub/{phone}
+            Method: DELETE
+
+  AgentSubscribe:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: agentSubscribe.handler
+      Runtime: nodejs12.x
+      Description: subscribe a url to the review topic
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName:
+              Ref: AuditionNotificationTopic
+      Environment:
+        Variables:
+          TopicName:
+            Ref: AuditionNotificationTopic      
+      Events:
+        SampleApi:
+          Type: Api
+          Properties:
+            Path: /agent/{state}/{name}
+            Method: PUT
+
+  AgentUnSubscribe:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: agentUnSubscribe.handler
+      Runtime: nodejs12.x
+      Description: subscribe a url to the review topic
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName:
+              Ref: AuditionNotificationTopic
+      Environment:
+        Variables:
+          TopicName:
+            Ref: AuditionNotificationTopic      
+      Events:
+        SampleApi:
+          Type: Api
+          Properties:
+            Path: /agent/{state}/{name}
+            Method: DELETE
+
+  ProducerNotify:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: producerNotify.handler
+      Runtime: nodejs12.x
+      Description: test a subscription to the review topic
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName:
+              Ref: AuditionNotificationTopic
+      Environment:
+        Variables:
+          TopicName:
+            Ref: AuditionNotificationTopic      
+      Events:
+        SampleApi:
+          Type: Api
+          Properties:
+            Path: /producer/notify/{state}/{gender}
+            # note will appear in the request body
+            Method: PUT
+
+
+
+
+######## WebSocket Page Updates ########
+
+# This section is at the end because it's so verbose, but really it's pretty simple.
+# It just sets up a web socket server, keeps track of the open connections and when somebody sends a 
+# message, everyone gets notified."
+
+# This isn't really required since the end user can just hit refresh to see that a notification has arrived, 
+# But I think it will look a lot cooler when all the appropriate windows get updated at once.
+
+  SimpleChatWebSocket:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: SimpleChatWebSocket
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref SimpleChatWebSocket
+      RouteKey: $connect
+      AuthorizationType: NONE
+      OperationName: ConnectRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref ConnectInteg
+          
+  ConnectInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref SimpleChatWebSocket
+      Description: Connect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri: 
+        Fn::Sub:
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnConnectFunction.Arn}/invocations
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref SimpleChatWebSocket
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      OperationName: DisconnectRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref DisconnectInteg
+  DisconnectInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref SimpleChatWebSocket
+      Description: Disconnect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri: 
+        Fn::Sub:
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OnDisconnectFunction.Arn}/invocations
+  
+  SendRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref SimpleChatWebSocket
+      RouteKey: sendmessage
+      AuthorizationType: NONE
+      OperationName: SendRoute
+      Target: !Join
+        - '/'
+        - - 'integrations'
+          - !Ref SendInteg
+  SendInteg:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref SimpleChatWebSocket
+      Description: Send Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri: 
+        Fn::Sub:
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SendMessageFunction.Arn}/invocations
+
+  Deployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+    - ConnectRoute
+    - SendRoute
+    - DisconnectRoute
+    Properties:
+      ApiId: !Ref SimpleChatWebSocket
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: Prod
+      Description: Prod Stage
+      DeploymentId: !Ref Deployment
+      ApiId: !Ref SimpleChatWebSocket
+
+  OnConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: onConnect.handler
+      MemorySize: 256
+      Runtime: nodejs12.x
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName: !Ref TableName
+  OnConnectPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - SimpleChatWebSocket
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OnConnectFunction
+      Principal: apigateway.amazonaws.com
+  OnDisconnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: onDisconnect.handler
+      MemorySize: 256
+      Runtime: nodejs12.x
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName: !Ref TableName
+  OnDisconnectPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - SimpleChatWebSocket
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref OnDisconnectFunction
+      Principal: apigateway.amazonaws.com
+  SendMessageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: onSendMessage.handler
+      MemorySize: 256
+      Runtime: nodejs12.x
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref TableName
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName: !Ref TableName
+      - Statement:
+        - Effect: Allow
+          Action:
+          - 'execute-api:ManageConnections'
+          Resource:
+          - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SimpleChatWebSocket}/*'
+  SendMessagePermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - SimpleChatWebSocket
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SendMessageFunction
+      Principal: apigateway.amazonaws.com
+
+
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+      - AttributeName: "connectionId"
+        AttributeType: "S"
+      KeySchema:
+      - AttributeName: "connectionId"
+        KeyType: "HASH"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      SSESpecification:
+        SSEEnabled: True
+      TableName: !Ref TableName
+
+
+Outputs:
+  ConnectionsTableArn:
+    Description: "Connections table ARN"
+    Value: !GetAtt ConnectionsTable.Arn
+
+  OnConnectFunctionArn:
+    Description: "OnConnect function ARN"
+    Value: !GetAtt OnConnectFunction.Arn
+
+  OnDisconnectFunctionArn:
+    Description: "OnDisconnect function ARN"
+    Value: !GetAtt OnDisconnectFunction.Arn
+
+  SendMessageFunctionArn:
+    Description: "SendMessage function ARN"
+    Value: !GetAtt SendMessageFunction.Arn
+
+  WebSocketURI:
+    Description: "The WSS Protocol URI to connect to"
+    Value: !Join [ '', [ 'wss://', !Ref SimpleChatWebSocket, '.execute-api.',!Ref 'AWS::Region','.amazonaws.com/',!Ref 'Stage'] ]
+
+
+
+Parameters:
+  TableName:
+    Type: String
+    Default: 'simplechat_connections'
+    Description: jh-busy-signal-db
+    MinLength: 3
+    MaxLength: 50
+    AllowedPattern: ^[A-Za-z_]+$
+    ConstraintDescription: 'Required. Can be characters and underscore only. No numbers or special characters allowed.'
+
